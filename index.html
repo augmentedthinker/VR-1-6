@@ -145,12 +145,15 @@
         }
       });
 
-      // 4. RETRO SUN COMPONENT
+      // 4. RETRO SUN COMPONENT (Now with Pulse Uniform)
       AFRAME.registerComponent('retro-sun', {
         init: function() {
           const geometry = new THREE.CircleGeometry(20, 32);
           const material = new THREE.ShaderMaterial({
-            uniforms: { uTime: { value: 0 } },
+            uniforms: { 
+              uTime: { value: 0 },
+              uPulse: { value: 0 } 
+            },
             vertexShader: `
               varying vec2 vUv;
               void main() {
@@ -160,29 +163,74 @@
             `,
             fragmentShader: `
               uniform float uTime;
+              uniform float uPulse;
               varying vec2 vUv;
               void main() {
                 vec2 uv = vUv * 2.0 - 1.0;
                 float d = length(uv);
                 if (d > 1.0) discard;
-                float stripes = step(0.1, sin(uv.y * 20.0 - uTime * 2.0));
-                vec3 color = mix(vec3(1.0, 0.8, 0.0), vec3(1.0, 0.0, 0.5), uv.y * 0.5 + 0.5);
+
+                // Modulate stripes and brightness with uPulse
+                float stripeFreq = 20.0 + (uPulse * 10.0);
+                float stripes = step(0.1, sin(uv.y * stripeFreq - uTime * 2.0));
+                
+                vec3 baseColor = mix(vec3(1.0, 0.8, 0.0), vec3(1.0, 0.0, 0.5), uv.y * 0.5 + 0.5);
+                vec3 pulseColor = mix(baseColor, vec3(1.0, 1.0, 1.0), uPulse * 0.5);
+                
                 float finalAlpha = stripes * (1.0 - smoothstep(0.8, 1.0, d));
-                gl_FragColor = vec4(color, finalAlpha);
+                gl_FragColor = vec4(pulseColor, finalAlpha);
               }
             `,
             transparent: true,
             side: THREE.DoubleSide
           });
+
           this.mesh = new THREE.Mesh(geometry, material);
           this.el.setObject3D('mesh', this.mesh);
+
+          this.isPulsing = false;
+          this.pulseVal = 0;
+
+          // Event listeners for craft interaction
+          this.el.addEventListener('sun-pulse-start', () => { this.isPulsing = true; });
+          this.el.addEventListener('sun-pulse-stop', () => { this.isPulsing = false; });
         },
         tick: function(time) {
-          if (this.mesh) this.mesh.material.uniforms.uTime.value = time / 1000;
+          if (!this.mesh) return;
+          this.mesh.material.uniforms.uTime.value = time / 1000;
+          
+          if (this.isPulsing) {
+            // Harmonic pulse while craft is inside
+            this.pulseVal = (Math.sin(time / 200) * 0.5 + 0.5);
+          } else {
+            // Fade out pulse
+            this.pulseVal = THREE.MathUtils.lerp(this.pulseVal, 0, 0.05);
+          }
+          this.mesh.material.uniforms.uPulse.value = this.pulseVal;
         }
       });
 
-      // 5. DYNAMIC TIC TAC CRAFT COMPONENT
+      // 5. PULSE EFFECT COMPONENT
+      AFRAME.registerComponent('vibrant-pulse', {
+        schema: { color: {default: '#00ffff'} },
+        init: function() {
+          this.el.setAttribute('geometry', {primitive: 'ring', radiusInner: 0.1, radiusOuter: 0.2});
+          this.el.setAttribute('material', {color: this.data.color, shader: 'flat', transparent: true, opacity: 1, side: 'double'});
+          this.el.setAttribute('rotation', {x: -90, y: 0, z: 0});
+          this.scale = 0.1;
+        },
+        tick: function(time, delta) {
+          this.scale += delta / 80; 
+          this.el.setAttribute('scale', {x: this.scale, y: this.scale, z: 1});
+          const opacity = 1 - (this.scale / 30);
+          this.el.setAttribute('material', 'opacity', opacity);
+          if (opacity <= 0) {
+            this.el.parentNode.removeChild(this.el);
+          }
+        }
+      });
+
+      // 6. CONTINUITY DYNAMIC TIC TAC
       AFRAME.registerComponent('tictac-dynamic', {
         init: function() {
           const geometry = new THREE.CapsuleGeometry(0.3, 1, 12, 12);
@@ -191,73 +239,165 @@
             emissive: '#ffffff',
             emissiveIntensity: 0.8,
             roughness: 0,
-            metalness: 1
+            metalness: 1,
+            transparent: true,
+            opacity: 1
           });
           this.mesh = new THREE.Mesh(geometry, material);
           this.el.setObject3D('mesh', this.mesh);
           
           this.targetPos = new THREE.Vector3();
           this.currentPos = new THREE.Vector3(20, 10, -40);
-          this.velocity = new THREE.Vector3();
-          this.state = 'hover'; // 'hover' or 'dash'
+          this.state = 'hover'; 
           this.stateTimer = 0;
+          this.audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+          
+          this.mountains = [
+            {x: 0, y: 5, z: -35},
+            {x: -15, y: 8, z: -30},
+            {x: -28, y: 12, z: -45},
+            {x: -45, y: 18, z: -55},
+            {x: 15, y: 6, z: -30},
+            {x: 30, y: 15, z: -48},
+            {x: 50, y: 12, z: -52}
+          ];
+
+          this.sunPos = new THREE.Vector3(0, 10, -50);
           this.pickNewTarget();
         },
+
+        playSynth: function(freq, duration) {
+          try {
+            const osc = this.audioCtx.createOscillator();
+            const gain = this.audioCtx.createGain();
+            osc.type = 'sine';
+            osc.frequency.setValueAtTime(freq, this.audioCtx.currentTime);
+            osc.frequency.exponentialRampToValueAtTime(freq * 0.2, this.audioCtx.currentTime + duration);
+            gain.gain.setValueAtTime(0.05, this.audioCtx.currentTime);
+            gain.gain.linearRampToValueAtTime(0, this.audioCtx.currentTime + duration);
+            osc.connect(gain);
+            gain.connect(this.audioCtx.destination);
+            osc.start();
+            osc.stop(this.audioCtx.currentTime + duration);
+          } catch(e) {}
+        },
+
+        pickSurfacePos: function() {
+            const roll = Math.random();
+            if (roll > 0.7) {
+                // Sun merge
+                return this.sunPos.clone();
+            } else if (roll > 0.4) {
+                // Floor merge
+                return new THREE.Vector3((Math.random() - 0.5) * 40, -1, -5 - Math.random() * 20);
+            } else {
+                // Mountain merge
+                const m = this.mountains[Math.floor(Math.random() * this.mountains.length)];
+                return new THREE.Vector3(m.x, m.y, m.z);
+            }
+        },
+
         pickNewTarget: function() {
-          // Choose a new random destination in the sky
-          this.targetPos.set(
-            (Math.random() - 0.5) * 80,
-            5 + Math.random() * 20,
-            -15 - Math.random() * 45
-          );
-          this.state = 'dash';
+          const roll = Math.random();
+          if (roll < 0.1) {
+            this.state = 'glide';
+            this.targetPos.set((Math.random() - 0.5) * 6, 1.6, 1.5); 
+          } else if (roll < 0.5) {
+            this.state = 'diving';
+            this.targetPos.copy(this.pickSurfacePos());
+          } else {
+            this.state = 'dash';
+            this.targetPos.set(
+              (Math.random() - 0.5) * 80,
+              10 + Math.random() * 15,
+              -20 - Math.random() * 40
+            );
+          }
           this.stateTimer = 0;
         },
+
+        createPulse: function(pos) {
+          const pulse = document.createElement('a-entity');
+          pulse.setAttribute('vibrant-pulse', {color: '#00ffff'});
+          pulse.setAttribute('position', pos);
+          this.el.sceneEl.appendChild(pulse);
+          this.playSynth(180, 2.5);
+        },
+
         tick: function(time, delta) {
           const dt = delta / 1000;
           this.stateTimer += dt;
 
-          if (this.state === 'dash') {
-            // High acceleration movement
-            const dir = new THREE.Vector3().subVectors(this.targetPos, this.currentPos);
-            const dist = dir.length();
-            
+          const dir = new THREE.Vector3().subVectors(this.targetPos, this.currentPos);
+          const dist = dir.length();
+
+          let targetOpacity = 1;
+          if (this.state === 'diving' && dist < 12) {
+            targetOpacity = Math.max(0, (dist - 1.0) / 11.0);
+          } else if (this.state === 'hidden') {
+            targetOpacity = 0;
+          } else if (this.state === 'rising') {
+            targetOpacity = Math.min(1, this.stateTimer / 2.0);
+          }
+          this.mesh.material.opacity = THREE.MathUtils.lerp(this.mesh.material.opacity, targetOpacity, 0.05);
+
+          if (this.state === 'dash' || this.state === 'glide' || this.state === 'diving') {
             if (dist < 0.5) {
-              this.state = 'hover';
-              this.stateTimer = 0;
+              if (this.state === 'diving') {
+                this.createPulse(this.currentPos.clone());
+                // If it was the sun, tell the sun to pulse
+                if (this.targetPos.distanceTo(this.sunPos) < 1) {
+                  const sunEl = document.querySelector('#the-sun');
+                  if (sunEl) sunEl.emit('sun-pulse-start');
+                  this.wasInSun = true;
+                }
+                this.state = 'hidden';
+                this.stateTimer = 0;
+              } else {
+                this.state = 'hover';
+                this.stateTimer = 0;
+              }
             } else {
               dir.normalize();
-              // Exponential acceleration
-              const speed = 40.0; 
+              const speed = (this.state === 'glide') ? 12.0 : 25.0;
               this.currentPos.addScaledVector(dir, speed * dt);
-              
-              // Tilt towards direction
               const targetRotation = new THREE.Quaternion().setFromUnitVectors(
                 new THREE.Vector3(0, 1, 0),
                 dir
               );
-              this.mesh.quaternion.slerp(targetRotation, 0.1);
+              this.mesh.quaternion.slerp(targetRotation, 0.03);
             }
+          } else if (this.state === 'hidden') {
+            if (this.stateTimer > 4.0) { // Stay hidden for a few seconds
+                if (this.wasInSun) {
+                  const sunEl = document.querySelector('#the-sun');
+                  if (sunEl) sunEl.emit('sun-pulse-stop');
+                  this.wasInSun = false;
+                }
+                this.currentPos.copy(this.pickSurfacePos());
+                this.targetPos.copy(this.currentPos).add(new THREE.Vector3(0, 10, 5));
+                this.createPulse(this.currentPos.clone());
+                this.state = 'rising';
+                this.stateTimer = 0;
+            }
+          } else if (this.state === 'rising') {
+             const riseDir = new THREE.Vector3().subVectors(this.targetPos, this.currentPos).normalize();
+             this.currentPos.addScaledVector(riseDir, 5.0 * dt);
+             if (this.stateTimer > 2.0) {
+                 this.state = 'hover';
+                 this.stateTimer = 0;
+             }
           } else if (this.state === 'hover') {
-            // Eerie wobble/jitter
-            this.currentPos.y += Math.sin(time / 200) * 0.01;
-            this.currentPos.x += Math.cos(time / 300) * 0.01;
-            
-            // Randomly decide to dash again after 1-3 seconds
-            if (this.stateTimer > 1 + Math.random() * 2) {
+            this.currentPos.y += Math.sin(time / 500) * 0.005;
+            if (this.stateTimer > 2 + Math.random() * 3) {
               this.pickNewTarget();
             }
-            
-            // Return to upright or random orientation
             const upright = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0,0,1), Math.PI/2);
-            this.mesh.quaternion.slerp(upright, 0.05);
+            this.mesh.quaternion.slerp(upright, 0.02);
           }
 
           this.el.setAttribute('position', this.currentPos);
-          
-          // Check boundary visibility
-          const playerDist = this.currentPos.length();
-          this.mesh.visible = playerDist > 1.2;
+          this.mesh.visible = this.mesh.material.opacity > 0.01;
         }
       });
     </script>
@@ -268,9 +408,14 @@
       <a-light type="ambient" intensity="0.4"></a-light>
       <a-light type="point" position="0 10 0" intensity="1" color="#ff00ff"></a-light>
       
+      <!-- GALAXY INNER WORLD -->
       <a-entity galaxy-boundary position="0 0 0"></a-entity>
+      
+      <!-- SYNTHWAVE OUTER WORLD -->
       <a-entity synth-grid rotation="-90 0 0" position="0 -1 0"></a-entity>
-      <a-entity retro-sun position="0 10 -50"></a-entity>
+      
+      <!-- RETRO SUN (With ID for craft targeting) -->
+      <a-entity id="the-sun" retro-sun position="0 10 -50"></a-entity>
 
       <!-- DYNAMIC TIC TAC -->
       <a-entity tictac-dynamic></a-entity>
@@ -286,8 +431,10 @@
       <a-cone position="50 3 -52" radius-bottom="15" height="20" color="#0a0015" segments-radial="4"></a-cone>
       <a-cone position="65 2 -35" radius-bottom="10" height="12" color="#200040" segments-radial="4"></a-cone>
 
+      <!-- Boundary Marker -->
       <a-ring radius-inner="0.99" radius-outer="1.01" rotation="-90 0 0" color="#ff00ff" opacity="0.8"></a-ring>
 
+      <!-- CAMERA / PLAYER -->
       <a-entity id="rig">
         <a-entity camera look-controls wasd-controls position="0 1.6 0">
             <a-cursor color="#00ffff" opacity="0.5"></a-cursor>
